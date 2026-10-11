@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <variant>
@@ -41,6 +42,8 @@ class CPDF_Color {
   uint32_t ComponentCount() const;
   bool IsColorSpaceRGB() const;
   bool IsColorSpaceGray() const;
+  // Original components of stock DeviceCMYK; other color spaces are excluded.
+  std::optional<std::array<float, 4>> GetDeviceCMYK() const;
   // Wrapper around GetRGB() that returns the RGB value as FX_COLORREF. The
   // GetRGB() return value is clamped to fit into FX_COLORREF, where the color
   // components are 8-bit fields within an unsigned integer.

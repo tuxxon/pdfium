@@ -60,21 +60,31 @@ constexpr const char* kResourceKeys[] = {"ExtGState", "Font", "XObject"};
 // Value: The resource names of a given type.
 using ResourcesMap = std::map<ByteString, std::set<ByteString>>;
 
-// Returns whether it wrote to `buf` or not.
-bool WriteColorToStream(fxcrt::ostringstream& buf, const CPDF_Color* color) {
-  if (!color || (!color->IsColorSpaceRGB() && !color->IsColorSpaceGray())) {
-    return false;
+// Writes a color and its fill/stroke operator. Keep DeviceCMYK components
+// rather than converting them to RGB or silently inheriting the default black.
+void WriteColorToStream(fxcrt::ostringstream& buf,
+                        const CPDF_Color* color,
+                        bool stroke) {
+  if (!color) {
+    return;
   }
-
+  if (auto components = color->GetDeviceCMYK()) {
+    WriteFloat(buf, (*components)[0]) << " ";
+    WriteFloat(buf, (*components)[1]) << " ";
+    WriteFloat(buf, (*components)[2]) << " ";
+    WriteFloat(buf, (*components)[3]) << (stroke ? " K " : " k ");
+    return;
+  }
+  if (!color->IsColorSpaceRGB() && !color->IsColorSpaceGray()) {
+    return;
+  }
   std::optional<FX_RGB_STRUCT<float>> colors = color->GetRGB();
   if (!colors.has_value()) {
-    return false;
+    return;
   }
-
   WriteFloat(buf, colors.value().red) << " ";
   WriteFloat(buf, colors.value().green) << " ";
-  WriteFloat(buf, colors.value().blue);
-  return true;
+  WriteFloat(buf, colors.value().blue) << (stroke ? " RG " : " rg ");
 }
 
 // Balances the "q" operator ProcessGraphics() emitted.
@@ -803,10 +813,9 @@ void CPDF_PageContentGenerator::ProcessPath(fxcrt::ostringstream* buf,
   EndProcessGraphics(*buf);
 }
 
-// This method supports color operators rg and RGB from Table 4.24 of PDF spec
-// 1.7. A color will not be set if the colorspace is not DefaultRGB or the RGB
-// values cannot be obtained. The method also adds an external graphics
-// dictionary, as described in Section 4.3.4.
+// This method supports DeviceCMYK k/K and RGB/Gray rg/RG color operators.
+// Other color spaces remain unsupported. The method also adds an external
+// graphics dictionary, as described in Section 4.3.4.
 // "rg" sets the fill color, "RG" sets the stroke color (using DefaultRGB)
 // "w" sets the stroke line width.
 // "ca" sets the fill alpha, "CA" sets the stroke alpha.
@@ -816,12 +825,8 @@ void CPDF_PageContentGenerator::ProcessPath(fxcrt::ostringstream* buf,
 void CPDF_PageContentGenerator::ProcessGraphics(fxcrt::ostringstream* buf,
                                                 CPDF_PageObject* pPageObj) {
   *buf << "q ";
-  if (WriteColorToStream(*buf, pPageObj->color_state().GetFillColor())) {
-    *buf << " rg ";
-  }
-  if (WriteColorToStream(*buf, pPageObj->color_state().GetStrokeColor())) {
-    *buf << " RG ";
-  }
+  WriteColorToStream(*buf, pPageObj->color_state().GetFillColor(), false);
+  WriteColorToStream(*buf, pPageObj->color_state().GetStrokeColor(), true);
   float line_width = pPageObj->graph_state().GetLineWidth();
   if (line_width != 1.0f) {
     WriteFloat(*buf, line_width) << " w ";

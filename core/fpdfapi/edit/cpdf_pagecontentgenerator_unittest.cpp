@@ -258,6 +258,60 @@ TEST_F(CPDFPageContentGeneratorTest, ProcessGraphics) {
                               kExpectedStringsLengthDifference));
 }
 
+TEST_F(CPDFPageContentGeneratorTest, ProcessDeviceCMYKPathGraphics) {
+  auto path_obj = std::make_unique<CPDF_PathObject>();
+  path_obj->set_stroke(true);
+  path_obj->set_filltype(CFX_FillRenderOptions::FillType::kWinding);
+  path_obj->path().AppendRect(1, 2, 3, 4);
+
+  RetainPtr<CPDF_ColorSpace> cmyk_cs = CPDF_ColorSpace::GetStockCS(
+      CPDF_ColorSpace::Family::kDeviceCMYK);
+  static const std::vector<float> fill_cmyk = {0, 0, 0, 0.18f};
+  static const std::vector<float> stroke_cmyk = {0.1f, 0.2f, 0.3f, 0.4f};
+  path_obj->mutable_color_state().SetFillColor(cmyk_cs, fill_cmyk);
+  path_obj->mutable_color_state().SetStrokeColor(cmyk_cs, stroke_cmyk);
+
+  auto page_dict = pdfium::MakeRetain<CPDF_Dictionary>();
+  auto test_page = pdfium::MakeRetain<CPDF_Page>(nullptr, page_dict);
+  CPDF_PageContentGenerator generator(test_page.Get());
+  fxcrt::ostringstream buf;
+  TestProcessPath(&generator, &buf, path_obj.get());
+
+  EXPECT_EQ("q 0 0 0 .18 k .1 .2 .3 .4 K 1 2 2 2 re B Q\n",
+            ByteString(buf));
+}
+
+TEST_F(CPDFPageContentGeneratorTest, ProcessDeviceCMYKTextGraphics) {
+  auto doc = std::make_unique<CPDF_TestDocument>();
+  doc->CreateNewDoc();
+
+  RetainPtr<CPDF_Dictionary> page_dict(doc->CreateNewPage(0));
+  auto test_page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
+  CPDF_PageContentGenerator generator(test_page.Get());
+  auto text_obj = std::make_unique<CPDF_TextObject>();
+  text_obj->mutable_text_state().SetFont(
+      CPDF_Font::GetStockFont(doc.get(), "Times-Roman"));
+  text_obj->mutable_text_state().SetFontSize(10.0f);
+
+  RetainPtr<CPDF_ColorSpace> cmyk_cs = CPDF_ColorSpace::GetStockCS(
+      CPDF_ColorSpace::Family::kDeviceCMYK);
+  static const std::vector<float> fill_cmyk = {0, 0, 0, 0.18f};
+  static const std::vector<float> stroke_cmyk = {0.1f, 0.2f, 0.3f, 0.4f};
+  text_obj->mutable_color_state().SetFillColor(cmyk_cs, fill_cmyk);
+  text_obj->mutable_color_state().SetStrokeColor(cmyk_cs, stroke_cmyk);
+  text_obj->Transform(CFX_Matrix(1, 0, 0, 1, 100, 100));
+  text_obj->SetText("CMYK");
+
+  fxcrt::ostringstream buf;
+  TestProcessText(&generator, &buf, text_obj.get());
+  const ByteString text_string(buf);
+  const ByteStringView expected_color_prefix =
+      "q 0 0 0 .18 k .1 .2 .3 .4 K BT ";
+  ASSERT_GE(text_string.GetLength(), expected_color_prefix.GetLength());
+  EXPECT_EQ(expected_color_prefix,
+            text_string.First(expected_color_prefix.GetLength()));
+}
+
 TEST_F(CPDFPageContentGeneratorTest, ProcessStandardText) {
   // Checking font whose font dictionary is not yet indirect object.
   auto doc = std::make_unique<CPDF_TestDocument>();
