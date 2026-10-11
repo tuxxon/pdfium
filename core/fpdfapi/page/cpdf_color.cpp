@@ -100,6 +100,19 @@ bool CPDF_Color::IsColorSpaceGray() const {
          CPDF_ColorSpace::GetStockCS(CPDF_ColorSpace::Family::kDeviceGray);
 }
 
+std::optional<std::array<float, 4>> CPDF_Color::GetDeviceCMYK() const {
+  if (cs_ !=
+      CPDF_ColorSpace::GetStockCS(CPDF_ColorSpace::Family::kDeviceCMYK)) {
+    return std::nullopt;
+  }
+  const auto* components = std::get_if<std::vector<float>>(&color_data_);
+  if (!components || components->size() < 4) {
+    return std::nullopt;
+  }
+  return std::array<float, 4>{(*components)[0], (*components)[1],
+                              (*components)[2], (*components)[3]};
+}
+
 std::optional<FX_COLORREF> CPDF_Color::GetColorRef() const {
   std::optional<FX_RGB_STRUCT<float>> maybe_rgb = GetRGB();
   if (!maybe_rgb.has_value()) {

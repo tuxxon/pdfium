@@ -87,6 +87,7 @@ source_set("page") {
     "cpdf_shadingobject.h",
     "cpdf_shadingpattern.cpp",
     "cpdf_shadingpattern.h",
+    "cpdf_sourcecontent.h",
     "cpdf_stitchfunc.cpp",
     "cpdf_stitchfunc.h",
     "cpdf_streamcontentparser.cpp",
