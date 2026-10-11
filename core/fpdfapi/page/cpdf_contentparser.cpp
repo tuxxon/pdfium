@@ -176,7 +176,22 @@ CPDF_ContentParser::Stage CPDF_ContentParser::GetContent() {
 CPDF_ContentParser::Stage CPDF_ContentParser::PrepareContent() {
   current_offset_ = 0;
 
+  auto source = std::make_unique<CPDF_SourceContent>();
+  auto capture_stream = [&source](const CPDF_StreamAcc* stream,
+                                  uint32_t offset) {
+    if (static_cast<size_t>(offset) + stream->GetSize() >
+        CPDF_SourceContent::kMaxDecodedBytes) {
+      source->valid = false;
+      return;
+    }
+    auto bytes = stream->GetSpan();
+    source->streams.push_back(
+        {stream->GetStream(), DataVector<uint8_t>(bytes.begin(), bytes.end()),
+         offset});
+  };
   if (stream_array_.empty()) {
+    capture_stream(single_stream_.Get(), 0);
+    page_object_holder_->SetSourceContent(std::move(source));
     data_ = single_stream_->GetSpan();
     return Stage::kParse;
   }
@@ -184,6 +199,7 @@ CPDF_ContentParser::Stage CPDF_ContentParser::PrepareContent() {
   FX_SAFE_UINT32 safe_size = 0;
   for (const auto& stream : stream_array_) {
     stream_segment_offsets_.push_back(safe_size.ValueOrDie());
+    capture_stream(stream.Get(), safe_size.ValueOrDie());
     safe_size += stream->GetSize();
     safe_size += 1;
     if (!safe_size.IsValid()) {
@@ -205,6 +221,7 @@ CPDF_ContentParser::Stage CPDF_ContentParser::PrepareContent() {
     data_span = data_span.subspan<1u>();
   }
   stream_array_.clear();
+  page_object_holder_->SetSourceContent(std::move(source));
   data_ = std::move(buffer);
   return Stage::kParse;
 }
@@ -234,6 +251,13 @@ CPDF_ContentParser::Stage CPDF_ContentParser::Parse() {
 }
 
 CPDF_ContentParser::Stage CPDF_ContentParser::CheckClip() {
+  if (auto* source = page_object_holder_->GetSourceContent()) {
+    for (const auto& object : *page_object_holder_) {
+      source->object_identities.push_back(
+          reinterpret_cast<uintptr_t>(object.get()));
+    }
+    source->complete = true;
+  }
   if (type3_char_) {
     type3_char_->InitializeFromStreamData(parser_->IsColored(),
                                           parser_->GetType3Data());

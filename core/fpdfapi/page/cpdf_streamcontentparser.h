@@ -79,6 +79,9 @@ class CPDF_StreamContentParser {
 
   static constexpr int kParamBufSize = 16;
 
+  std::optional<uint32_t> source_operand_start_;
+  uint32_t source_operand_count_ = 0;
+
   void AddNameParam(ByteStringView bsName);
   void AddNumberParam(ByteStringView str);
   void AddObjectParam(RetainPtr<CPDF_Object> pObj);
@@ -96,6 +99,8 @@ class CPDF_StreamContentParser {
   // Makes a matrix from {GetNumber(5), ..., GetNumber(0)}.
   CFX_Matrix GetMatrix() const;
   void OnOperator(ByteStringView op);
+  void RecordSourceOperator(ByteStringView op, uint32_t end);
+  bool SourceOperandsAreValid(ByteStringView op);
   void AddTextObject(pdfium::span<const ByteString> strings,
                      pdfium::span<const float> kernings,
                      float initial_kerning);

@@ -604,6 +604,76 @@ void CPDF_StreamContentParser::OnOperator(ByteStringView op) {
   }
 }
 
+bool CPDF_StreamContentParser::SourceOperandsAreValid(ByteStringView op) {
+  auto numbers = [this](uint32_t count) {
+    if (source_operand_count_ != count) {
+      return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+      auto value = GetObject(i);
+      if (!value || !value->IsNumber()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (op == "q" || op == "Q" || op == "BT" || op == "ET" || op == "T*") {
+    return source_operand_count_ == 0;
+  }
+  if (op == "Tm") {
+    return numbers(6);
+  }
+  if (op == "Td" || op == "TD") {
+    return numbers(2);
+  }
+  if (op == "Do") {
+    auto value = GetObject(0);
+    return source_operand_count_ == 1 && value && value->IsName();
+  }
+  if (op == "Tj" || op == "'") {
+    auto value = GetObject(0);
+    return source_operand_count_ == 1 && value && value->IsString();
+  }
+  if (op == "\"") {
+    auto text = GetObject(0);
+    auto character = GetObject(1);
+    auto word = GetObject(2);
+    return source_operand_count_ == 3 && text && text->IsString() &&
+           character && character->IsNumber() && word && word->IsNumber();
+  }
+  if (op == "TJ") {
+    auto array = ToArray(GetObject(0));
+    if (source_operand_count_ != 1 || !array) {
+      return false;
+    }
+    for (size_t i = 0; i < array->size(); ++i) {
+      auto value = array->GetDirectObjectAt(i);
+      if (!value || (!value->IsString() && !value->IsNumber())) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void CPDF_StreamContentParser::RecordSourceOperator(ByteStringView op,
+                                                    uint32_t end) {
+  auto* source = object_holder_->GetSourceContent();
+  if (!source || !source->valid) {
+    return;
+  }
+  // PDFium's opcode dispatch uses a compact ID. Do not grant provenance to
+  // unknown or overlong keywords that can alias an opcode in permissive input.
+  if (op.GetLength() > 3 || g_opcodes->find(op.GetID()) == g_opcodes->end() ||
+      source->operations.size() >= CPDF_SourceContent::kMaxOperations ||
+      !source_operand_start_) {
+    source->valid = false;
+    return;
+  }
+  source->operations.push_back({ByteString(op), *source_operand_start_, end,
+                                SourceOperandsAreValid(op), std::nullopt});
+}
+
 void CPDF_StreamContentParser::Handle_CloseFillStrokePath() {
   Handle_ClosePath();
   AddPathObject(CFX_FillRenderOptions::FillType::kWinding, RenderType::kStroke);
@@ -1669,13 +1739,36 @@ uint32_t CPDF_StreamContentParser::Parse(
     if (max_cost && cost >= max_cost) {
       break;
     }
-    switch (syntax_->ParseNextElement()) {
+    auto element = syntax_->ParseNextElement();
+    if (element != CPDF_StreamParser::ElementType::kEndOfData &&
+        !source_operand_start_) {
+      source_operand_start_ = syntax_->GetTokenStart() + start_parse_offset_;
+    }
+    if (element != CPDF_StreamParser::ElementType::kEndOfData &&
+        element != CPDF_StreamParser::ElementType::kKeyword) {
+      ++source_operand_count_;
+    }
+    switch (element) {
       case CPDF_StreamParser::ElementType::kEndOfData:
         return syntax_->GetPos();
-      case CPDF_StreamParser::ElementType::kKeyword:
-        OnOperator(syntax_->GetWord());
+      case CPDF_StreamParser::ElementType::kKeyword: {
+        ByteString op(syntax_->GetWord());
+        const size_t before = object_holder_->GetPageObjectCount();
+        auto* source = object_holder_->GetSourceContent();
+        RecordSourceOperator(op.AsStringView(),
+                             syntax_->GetPos() + start_parse_offset_);
+        OnOperator(op.AsStringView());
+        if (source && source->valid &&
+            (op == "Tj" || op == "TJ" || op == "'" || op == "\"") &&
+            object_holder_->GetPageObjectCount() == before + 1 &&
+            object_holder_->GetPageObjectByIndex(before)->IsText()) {
+          source->operations.back().text_object_index = before;
+        }
         ClearAllParams();
+        source_operand_start_.reset();
+        source_operand_count_ = 0;
         break;
+      }
       case CPDF_StreamParser::ElementType::kNumber:
         AddNumberParam(syntax_->GetWord());
         break;

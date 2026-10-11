@@ -284,6 +284,8 @@ CPDF_StreamParser::ElementType CPDF_StreamParser::ParseNextElement() {
     }
   }
 
+  token_start_ = pos_ - 1;
+
   if (PDFCharIsDelimiter(ch) && ch != '/') {
     pos_--;
     last_obj_ = ReadNextObject(false, false, 0);

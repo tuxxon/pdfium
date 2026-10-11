@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/fpdfapi/page/cpdf_sourcecontent.h"
 #include "core/fpdfapi/page/cpdf_transparency.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fxcrt/bytestring.h"
@@ -77,6 +78,11 @@ class CPDF_PageObjectHolder {
   virtual ~CPDF_PageObjectHolder();
 
   virtual bool IsPage() const;
+
+  CPDF_SourceContent* GetSourceContent() { return source_content_.get(); }
+  void SetSourceContent(std::unique_ptr<CPDF_SourceContent> source) {
+    source_content_ = std::move(source);
+  }
 
   void StartParse(std::unique_ptr<CPDF_ContentParser> pParser);
   void ContinueParse(PauseIndicatorIface* pPause);
@@ -157,6 +163,7 @@ class CPDF_PageObjectHolder {
   CPDF_Transparency transparency_;
 
  private:
+  std::unique_ptr<CPDF_SourceContent> source_content_;
   bool background_alpha_needed_ = false;
   ParseState parse_state_ = ParseState::kNotParsed;
   RetainPtr<CPDF_Dictionary> const dict_;

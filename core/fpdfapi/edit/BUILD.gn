@@ -23,6 +23,8 @@ source_set("edit") {
     "cpdf_pageexporter.h",
     "cpdf_pageorganizer.cpp",
     "cpdf_pageorganizer.h",
+    "cpdf_sourcecontentremover.cpp",
+    "cpdf_sourcecontentremover.h",
     "cpdf_stringarchivestream.cpp",
     "cpdf_stringarchivestream.h",
   ]
@@ -45,6 +47,7 @@ pdfium_unittest_source_set("unittests") {
   sources = [
     "cpdf_npagetooneexporter_unittest.cpp",
     "cpdf_pagecontentgenerator_unittest.cpp",
+    "cpdf_sourcecontentremover_unittest.cpp",
   ]
   deps = [
     ":edit",
