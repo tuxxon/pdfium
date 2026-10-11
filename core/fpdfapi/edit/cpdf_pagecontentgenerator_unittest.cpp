@@ -6,6 +6,7 @@
 
 #include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "core/fpdfapi/font/cpdf_font.h"
@@ -312,6 +313,51 @@ TEST_F(CPDFPageContentGeneratorTest, ProcessDeviceCMYKTextGraphics) {
             text_string.First(expected_color_prefix.GetLength()));
 }
 
+TEST_F(CPDFPageContentGeneratorTest, ProcessTextPreservesCharacterAndWordSpace) {
+  auto doc = std::make_unique<CPDF_TestDocument>();
+  doc->CreateNewDoc();
+
+  RetainPtr<CPDF_Dictionary> page_dict(doc->CreateNewPage(0));
+  auto test_page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
+  CPDF_PageContentGenerator generator(test_page.Get());
+  auto text_obj = std::make_unique<CPDF_TextObject>();
+  auto& text_state = text_obj->mutable_text_state();
+  text_state.SetFont(CPDF_Font::GetStockFont(doc.get(), "Times-Roman"));
+  text_state.SetFontSize(10.0f);
+  text_state.SetCharSpace(0.25f);
+  text_state.SetWordSpace(-0.5f);
+  text_obj->SetText("A B");
+
+  fxcrt::ostringstream buf;
+  TestProcessText(&generator, &buf, text_obj.get());
+  const ByteString output(buf);
+  EXPECT_NE(std::string::npos,
+            std::string(output.c_str()).find(
+                " Tf 0 Tr .25 Tc -.5 Tw ["));
+}
+
+TEST_F(CPDFPageContentGeneratorTest, ProcessTextResetsCharacterAndWordSpace) {
+  auto doc = std::make_unique<CPDF_TestDocument>();
+  doc->CreateNewDoc();
+
+  RetainPtr<CPDF_Dictionary> page_dict(doc->CreateNewPage(0));
+  auto test_page = pdfium::MakeRetain<CPDF_Page>(doc.get(), page_dict);
+  CPDF_PageContentGenerator generator(test_page.Get());
+  auto text_obj = std::make_unique<CPDF_TextObject>();
+  auto& text_state = text_obj->mutable_text_state();
+  text_state.SetFont(CPDF_Font::GetStockFont(doc.get(), "Times-Roman"));
+  text_state.SetFontSize(10.0f);
+  text_state.SetCharSpace(0.0f);
+  text_state.SetWordSpace(0.0f);
+  text_obj->SetText("A B");
+
+  fxcrt::ostringstream buf;
+  TestProcessText(&generator, &buf, text_obj.get());
+  const ByteString output(buf);
+  EXPECT_NE(std::string::npos,
+            std::string(output.c_str()).find(" Tf 0 Tr 0 Tc 0 Tw ["));
+}
+
 TEST_F(CPDFPageContentGeneratorTest, ProcessStandardText) {
   // Checking font whose font dictionary is not yet indirect object.
   auto doc = std::make_unique<CPDF_TestDocument>();
@@ -355,7 +401,7 @@ TEST_F(CPDFPageContentGeneratorTest, ProcessStandardText) {
   // Color RGB values used are integers divided by 255.
   const ByteString kCompareString2 = " gs BT 1 0 0 1 100 100 Tm /";
   const ByteString kCompareString3 =
-      " 10 Tf 0 Tr [<48656C6C6F20576F726C64>] TJ ET Q\n";
+      " 10 Tf 0 Tr 0 Tc 0 Tw [<48656C6C6F20576F726C64>] TJ ET Q\n";
   EXPECT_LT(kCompareString1.GetLength() + kCompareString2.GetLength() +
                 kCompareString3.GetLength(),
             text_string.GetLength());
@@ -433,7 +479,7 @@ TEST_F(CPDFPageContentGeneratorTest, ProcessText) {
   // q and Q must be outside the BT .. ET operations
   ByteString compare_string1 = "q 0 0 5 4 re W* n BT /";
   ByteString compare_string2 =
-      " 15.5 Tf 4 Tr [<4920616D20696E646972656374>] TJ ET Q\n";
+      " 15.5 Tf 4 Tr 0 Tc 0 Tw [<4920616D20696E646972656374>] TJ ET Q\n";
   EXPECT_LT(compare_string1.GetLength() + compare_string2.GetLength(),
             text_string.GetLength());
   EXPECT_EQ(compare_string1, text_string.First(compare_string1.GetLength()));

@@ -1002,6 +1002,10 @@ void CPDF_PageContentGenerator::ProcessText(fxcrt::ostringstream* buf,
   *buf << "/" << PDF_NameEncode(dict_name) << " ";
   WriteFloat(*buf, pTextObj->GetFontSize()) << " Tf ";
   *buf << static_cast<int>(pTextObj->GetTextRenderMode()) << " Tr ";
+  // Text spacing is independent of TJ kerning. Emit zero values as well so
+  // this object does not inherit spacing from an earlier content stream.
+  WriteFloat(*buf, pTextObj->text_state().GetCharSpace()) << " Tc ";
+  WriteFloat(*buf, pTextObj->text_state().GetWordSpace()) << " Tw ";
 
   *buf << "[";
   ByteString text;
