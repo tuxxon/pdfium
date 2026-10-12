@@ -1,0 +1,22 @@
+# Copyright 2026 The PDFium Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("../../pdfium.gni")
+
+# Host-only audit of the source-stream owned-text remover. Like pdfium_test,
+# it depends on PDFium internals for convenience; it is not shipped.
+executable("pdftrans_source_preservation_audit") {
+  testonly = true
+  sources = [ "source_preservation_audit.cc" ]
+  deps = [
+    "../../:pdfium_public_headers",
+    "../../core/fdrm",
+    "../../core/fpdfapi/edit",
+    "../../core/fpdfapi/font",
+    "../../core/fpdfapi/page",
+    "../../core/fpdfapi/parser",
+    "../../fpdfsdk",
+  ]
+  configs += [ "../../:pdfium_core_config" ]
+}

@@ -5,6 +5,7 @@
 #include "core/fpdfapi/edit/cpdf_sourcecontentremover.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <utility>
@@ -15,6 +16,7 @@
 #include "core/fpdfapi/page/cpdf_formobject.h"
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/page/cpdf_sourcecontent.h"
+#include "core/fpdfapi/page/cpdf_streamparser.h"
 #include "core/fpdfapi/page/cpdf_textobject.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
@@ -22,6 +24,8 @@
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
+#include "core/fpdfapi/parser/fpdf_parser_decode.h"
+#include "core/fpdfapi/parser/fpdf_parser_utility.h"
 #include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/span.h"
 
@@ -86,65 +90,241 @@ std::optional<size_t> FindStream(const CPDF_SourceContent& source,
   return std::nullopt;
 }
 
-Result ValidateCursorDependencies(const CPDF_SourceContent& source,
-                                   const std::set<size_t>& selected) {
-  bool tainted = false;
-  bool in_text = false;
-  std::vector<bool> saved_taint;
+constexpr size_t kMaxXObjectDepth = 16;
+
+bool IsTextShow(ByteStringView op) {
+  return op == "Tj" || op == "TJ" || op == "'" || op == "\"";
+}
+
+// ISO 32000-1 Table A.1. Other viewers split or alias unknown keywords, e.g.
+// pdf.js reads "Tjq" as Tj followed by q.
+bool IsKnownOperator(ByteStringView op) {
+  static constexpr auto kOperators = std::to_array<const char*>({
+      "b",  "B",  "b*", "B*", "BDC", "BI",  "BMC", "BT",  "BX", "c",  "cm",
+      "CS", "cs", "d",  "d0", "d1",  "Do",  "DP",  "EI",  "EMC", "ET", "EX",
+      "f",  "F",  "f*", "G",  "g",   "gs",  "h",   "i",   "ID", "j",  "J",
+      "K",  "k",  "l",  "m",  "M",   "MP",  "n",   "q",   "Q",  "re", "RG",
+      "rg", "ri", "s",  "S",  "SC",  "sc",  "SCN", "scn", "sh", "T*", "Tc",
+      "Td", "TD", "Tf", "Tj", "TJ",  "TL",  "Tm",  "Tr",  "Ts", "Tw", "Tz",
+      "v",  "w",  "W",  "W*", "y",   "'",   "\""});
+  return std::ranges::any_of(kOperators,
+                             [op](const char* known) { return op == known; });
+}
+
+enum class CursorStep { kOk, kReadsTaint, kMalformed };
+
+// Whether the text position may still depend on a removed show (or, inside a
+// Form, on the caller), under two models that must both be clean:
+//  - PDFium, pdf.js and poppler save the position with q, restore it with Q,
+//    keep it after ET and pass it to Forms.
+//  - ISO 32000 keeps the text matrices out of the graphics state: Q does not
+//    restore them and they end at ET (task 28, tuxxon/pdfium 1ae4821).
+class CursorTaint {
+ public:
+  explicit CursorTaint(bool initially_tainted) : tainted_(initially_tainted) {}
+
+  // `removed` marks a show whose bytes are blanked.
+  CursorStep Apply(ByteStringView op, bool removed) {
+    if (op == "q") {
+      saved_.push_back(tainted_);
+    } else if (op == "Q") {
+      if (saved_.empty()) {
+        return CursorStep::kMalformed;
+      }
+      tainted_ = saved_.back();
+      saved_.pop_back();
+    } else if (op == "BT") {
+      if (in_text_) {
+        return CursorStep::kMalformed;
+      }
+      in_text_ = true;
+      tainted_ = false;
+    } else if (op == "ET") {
+      if (!in_text_) {
+        return CursorStep::kMalformed;
+      }
+      in_text_ = false;
+      // The spec text matrices end here; PDFium keeps the position.
+      spec_tainted_ = false;
+    } else if (op == "Tm" || op == "Td" || op == "TD" || op == "T*") {
+      tainted_ = false;
+      spec_tainted_ = false;
+    } else if (IsTextShow(op)) {
+      if (!in_text_) {
+        return CursorStep::kMalformed;
+      }
+      if (removed) {
+        // Only plain Tj/TJ pass selection validation. Neither changes the line
+        // position; mark their current-text-position effect as unknown.
+        tainted_ = true;
+        spec_tainted_ = true;
+      } else {
+        // Retained quote operators first reset position from the text line.
+        if (op == "'" || op == "\"") {
+          tainted_ = false;
+          spec_tainted_ = false;
+        }
+        if (tainted()) {
+          return CursorStep::kReadsTaint;
+        }
+      }
+    }
+    return CursorStep::kOk;
+  }
+
+  bool Balanced() const { return !in_text_ && saved_.empty(); }
+  bool tainted() const { return tainted_ || spec_tainted_; }
+  bool in_text() const { return in_text_; }
+
+ private:
+  bool tainted_;
+  bool spec_tainted_ = false;
+  bool in_text_ = false;
+  std::vector<bool> saved_;
+};
+
+bool XObjectIgnoresTextPosition(const CPDF_Dictionary* resources,
+                                const ByteString& name,
+                                size_t depth);
+
+// A Do while the position is tainted is safe only outside a text object, where
+// ISO 32000 allows it, and only for an XObject that ignores the position.
+bool TaintedDoIsSafe(const CursorTaint& cursor,
+                     const CPDF_Dictionary* resources,
+                     const std::optional<ByteString>& name,
+                     size_t depth) {
+  return !cursor.in_text() && name &&
+         XObjectIgnoresTextPosition(resources, *name, depth);
+}
+
+// Whether painting XObject `name` from `resources` cannot read the caller's
+// text position. PDFium starts a Form with a fresh text position (AddForm
+// copies only the general, graph, color and text states), but pdf.js and
+// poppler pass it on and the saved PDF is opened by them too. So accept only
+// an Image, or a Form whose shows never read the inherited position and whose
+// nested XObjects pass the same test. Cycles end at the depth limit.
+bool XObjectIgnoresTextPosition(const CPDF_Dictionary* resources,
+                                const ByteString& name,
+                                size_t depth) {
+  if (depth > kMaxXObjectDepth || !resources) {
+    return false;
+  }
+  // No fallback to the page's XObjects: PDFium and poppler fall back
+  // differently.
+  RetainPtr<const CPDF_Dictionary> xobjects = resources->GetDictFor("XObject");
+  RetainPtr<const CPDF_Stream> xobject =
+      xobjects ? ToStream(xobjects->GetDirectObjectFor(name.AsStringView()))
+               : nullptr;
+  if (!xobject) {
+    return false;
+  }
+  RetainPtr<const CPDF_Dictionary> dict = xobject->GetDict();
+  const ByteString subtype = dict->GetByteStringFor("Subtype");
+  if (subtype == "Image") {
+    return true;
+  }
+  // Other viewers read an external /F stream instead of these bytes.
+  if (subtype != "Form" || dict->KeyExist("F")) {
+    return false;
+  }
+  const std::optional<DecoderArray> decoders = GetDecoderArray(dict);
+  if (!decoders) {
+    return false;
+  }
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(xobject);
+  acc->LoadAllDataFiltered();
+  if (!decoders->empty()) {
+    // A failed filter leaves PDFium the raw bytes; other viewers may decode
+    // more.
+    auto raw = pdfium::MakeRetain<CPDF_StreamAcc>(xobject);
+    raw->LoadAllDataRaw();
+    if (std::ranges::equal(acc->GetSpan(), raw->GetSpan())) {
+      return false;
+    }
+  }
+  RetainPtr<const CPDF_Dictionary> form_resources = dict->GetDictFor("Resources");
+  if (!form_resources) {
+    form_resources = pdfium::WrapRetain(resources);
+  }
+  CPDF_StreamParser parser(acc->GetSpan());
+  CursorTaint cursor(/*initially_tainted=*/true);
+  // PDFium paints a Do's last operand; check it only when it is a name.
+  std::optional<ByteString> operand;
+  while (true) {
+    const auto type = parser.ParseNextElement();
+    if (type == CPDF_StreamParser::kEndOfData) {
+      break;
+    }
+    if (type != CPDF_StreamParser::kKeyword) {
+      // A null object is a malformed dictionary or array, which other parsers
+      // resynchronize differently.
+      if (type == CPDF_StreamParser::kOther && !parser.GetObject()) {
+        return false;
+      }
+      operand.reset();
+      if (type == CPDF_StreamParser::kName) {
+        operand = PDF_NameDecode(parser.GetWord().Substr(1));
+      }
+      continue;
+    }
+    const ByteStringView word = parser.GetWord();
+    // Inline image data cannot be skipped without the image parser.
+    if (word == "BI" || !IsKnownOperator(word) ||
+        cursor.Apply(word, /*removed=*/false) != CursorStep::kOk) {
+      return false;
+    }
+    if (word == "Do" && cursor.tainted() &&
+        !TaintedDoIsSafe(cursor, form_resources.Get(), operand, depth + 1)) {
+      return false;
+    }
+    operand.reset();
+  }
+  // Painting wraps the Form in q/Q, so leftover q or BT cannot reach the caller.
+  return true;
+}
+
+// The XObject name of a top-level Do. `valid_operands` already guarantees a
+// lone name operand, so this check and PDFium agree on the painted XObject.
+std::optional<ByteString> DoOperand(const CPDF_SourceContent& source,
+                                    const CPDF_SourceContent::Operation& op) {
+  const auto stream_index = FindStream(source, op);
+  if (!stream_index) {
+    return std::nullopt;
+  }
+  const auto& stream = source.streams[*stream_index];
+  CPDF_StreamParser parser(pdfium::span(stream.decoded)
+                               .subspan(op.begin - stream.offset,
+                                        op.end - op.begin));
+  if (parser.ParseNextElement() != CPDF_StreamParser::kName) {
+    return std::nullopt;
+  }
+  return PDF_NameDecode(parser.GetWord().Substr(1));
+}
+
+Result ValidateCursorDependencies(const CPDF_Page& page,
+                                  const CPDF_SourceContent& source,
+                                  const std::set<size_t>& selected) {
+  CursorTaint cursor(/*initially_tainted=*/false);
   for (const auto& op : source.operations) {
-    const ByteString& name = op.name;
     const bool removed = op.text_object_index &&
                          selected.contains(*op.text_object_index);
     if (!op.valid_operands) {
       return Result::kUnsupportedContent;
     }
-    if (name == "q") {
-      saved_taint.push_back(tainted);
-    } else if (name == "Q") {
-      if (saved_taint.empty()) {
-        return Result::kUnsupportedContent;
-      }
-      tainted = saved_taint.back();
-      saved_taint.pop_back();
-    } else if (name == "BT") {
-      if (in_text) {
-        return Result::kUnsupportedContent;
-      }
-      in_text = true;
-      tainted = false;
-    } else if (name == "ET") {
-      if (!in_text) {
-        return Result::kUnsupportedContent;
-      }
-      in_text = false;
-      // ET finalizes text clipping; PDFium does not reset text position here.
-    } else if (name == "Tm" || name == "Td" || name == "TD" || name == "T*") {
-      tainted = false;
-    } else if (name == "Tj" || name == "TJ" || name == "'" || name == "\"") {
-      if (!in_text) {
-        return Result::kUnsupportedContent;
-      }
-      if (removed) {
-        // Only plain Tj/TJ pass selection validation. Neither changes the line
-        // position; mark their current-text-position effect as unknown.
-        tainted = true;
-      } else {
-        // Retained quote operators first reset position from the text line.
-        if (name == "'" || name == "\"") {
-          tainted = false;
-        }
-        if (tainted) {
-          return Result::kTextPositionDependency;
-        }
-      }
-    } else if (name == "Do" && tainted) {
-      // Form parsing copies the parent's whole CPDF_AllStates. Do not assume
-      // a Form starts with BT. Conservatively reject image Do as well.
+    const CursorStep step = cursor.Apply(op.name.AsStringView(), removed);
+    if (step == CursorStep::kMalformed) {
+      return Result::kUnsupportedContent;
+    }
+    if (step == CursorStep::kReadsTaint) {
+      return Result::kTextPositionDependency;
+    }
+    if (op.name == "Do" && cursor.tainted() &&
+        !TaintedDoIsSafe(cursor, page.GetResources().Get(),
+                         DoOperand(source, op), /*depth=*/0)) {
       return Result::kTextPositionDependency;
     }
   }
-  return in_text || !saved_taint.empty() ? Result::kUnsupportedContent
-                                        : Result::kSuccess;
+  return cursor.Balanced() ? Result::kSuccess : Result::kUnsupportedContent;
 }
 }  // namespace
 
@@ -246,7 +426,8 @@ Result CPDF_RemoveOwnedTextPreservingStreams(
   if (matched != selected) {
     return Result::kNoSourceProvenance;
   }
-  const Result dependencies = ValidateCursorDependencies(*source, selected);
+  const Result dependencies =
+      ValidateCursorDependencies(*page, *source, selected);
   if (dependencies != Result::kSuccess) {
     return dependencies;
   }

@@ -425,6 +425,7 @@ group("pdfium_all") {
     "testing:pdfium_diff",
     "testing/fuzzers",
     "testing/pdfium_test",
+    "testing/pdftrans:pdftrans_source_preservation_audit",
   ]
 
   if (pdf_is_standalone) {
