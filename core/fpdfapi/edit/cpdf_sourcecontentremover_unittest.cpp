@@ -81,6 +81,36 @@ class CPDFSourceContentRemoverTest : public TestWithPageModule {
     return form;
   }
 
+  // Adds a named XObject beside existing ones. A Form gets a snapshot of the
+  // current resources, so XObjects added earlier are visible inside it.
+  RetainPtr<CPDF_Stream> AddXObject(const std::string& name,
+                                    const std::string& content,
+                                    const char* subtype,
+                                    bool own_resources = true) {
+    auto xobject =
+        doc_->NewIndirect<CPDF_Stream>(pdfium::as_byte_span(content));
+    auto dict = xobject->GetMutableDict();
+    dict->SetNewFor<CPDF_Name>("Type", "XObject");
+    dict->SetNewFor<CPDF_Name>("Subtype", subtype);
+    if (std::string(subtype) == "Form") {
+      auto box = dict->SetNewFor<CPDF_Array>("BBox");
+      for (int value : {0, 0, 300, 300}) {
+        box->AppendNew<CPDF_Number>(value);
+      }
+      if (own_resources) {
+        dict->SetFor("Resources", resources_->Clone());
+      }
+    } else if (std::string(subtype) == "Image") {
+      dict->SetNewFor<CPDF_Number>("Width", 1);
+      dict->SetNewFor<CPDF_Number>("Height", 1);
+      dict->SetNewFor<CPDF_Number>("BitsPerComponent", 8);
+      dict->SetNewFor<CPDF_Name>("ColorSpace", "DeviceGray");
+    }
+    resources_->GetOrCreateDictFor("XObject")->SetNewFor<CPDF_Reference>(
+        ByteString(name.c_str()), doc_.get(), xobject->GetObjNum());
+    return xobject;
+  }
+
   RetainPtr<CPDF_Page> MakePage(const std::vector<std::string>& contents) {
     auto dict = doc_->CreateNewPage(page_count_++);
     dict->SetFor("Resources", resources_);
@@ -204,6 +234,8 @@ TEST_F(CPDFSourceContentRemoverTest, QCanRestoreTaintedCursorAfterTm) {
   EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
 }
 
+// From task 28 (tuxxon/pdfium 1ae4821): ISO 32000 keeps the text matrices out
+// of the graphics state, so Q does not restore them in a spec viewer.
 TEST_F(CPDFSourceContentRemoverTest, QDoesNotRestoreTaintedCursor) {
   // PDFium restores the text position on Q; spec viewers do not.
   auto page = MakePage({"BT /F1 12 Tf q (ERASE) Tj Q (KEEP) Tj ET"});
@@ -217,6 +249,22 @@ TEST_F(CPDFSourceContentRemoverTest, CursorResetInsideOrAfterQClearsTaint) {
                            "q (ERASE) Tj Q 0 -14 Td (KEEP) Tj"}) {
     auto page = MakePage({std::string("BT /F1 12 Tf ") + body + " ET"});
     EXPECT_EQ(Result::kSuccess, Remove(page.Get())) << body;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, SpecTaintEndsAtETAndQRestoresTheRest) {
+  // Q restores PDFium's untainted position and ET ends the spec matrices, so
+  // even a Form that reads the inherited position is unaffected.
+  AddXObject("Fm", "(KEEP) Tj", "Form");
+  auto page = MakePage({"BT /F1 12 Tf q (ERASE) Tj Q ET /Fm Do"});
+  EXPECT_EQ(Result::kSuccess, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, RetainedQuoteResetsBothModels) {
+  for (const char* show : {"(KEEP) '", "1 2 (KEEP) \""}) {
+    auto page = MakePage({std::string("BT /F1 12 Tf 14 TL (ERASE) Tj ") +
+                          show + " ET"});
+    EXPECT_EQ(Result::kSuccess, Remove(page.Get())) << show;
   }
 }
 
@@ -332,6 +380,191 @@ TEST_F(CPDFSourceContentRemoverTest, FormWithoutBTCanReadDeletedCursor) {
   auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Fm Do"});
   EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
   EXPECT_EQ("(KEEP) Tj", Decode(form.Get()));
+}
+
+// pdfTeX figures: the last line before an included PDF figure is removed, then
+// ET ... /Im1 Do. A Form whose text shows all sit in its own BT/ET cannot read
+// the caller's cursor (BT resets it), so the deletion must be accepted.
+TEST_F(CPDFSourceContentRemoverTest, FormWithOwnTextObjectsIgnoresDeletedCursor) {
+  const std::string figure = "q BT /F1 12 Tf 5 5 Td (KEEP) Tj ET Q";
+  auto form = AddXObject("Im1", figure, "Form");
+  const std::string content =
+      "BT /F1 12 Tf 10 10 Td (ERASE) Tj ET q 1 0 0 1 0 0 cm /Im1 Do Q";
+  auto page = MakePage({content});
+  EXPECT_EQ(Result::kSuccess, Remove(page.Get()));
+  EXPECT_EQ(Blank(content, "(ERASE) Tj"), Decode(Stream(page.Get()).Get()));
+  EXPECT_EQ(figure, Decode(form.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, ImageXObjectIgnoresDeletedCursor) {
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  const std::string content = "BT /F1 12 Tf (ERASE) Tj ET /Im Do";
+  auto page = MakePage({content});
+  EXPECT_EQ(Result::kSuccess, Remove(page.Get()));
+  EXPECT_EQ(Blank(content, "(ERASE) Tj"), Decode(Stream(page.Get()).Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormShowOutsideItsTextObjectRejects) {
+  for (const char* figure :
+       {"BT ET (KEEP) Tj", "q BT ET Q [(KEEP)] TJ", "BT ET (KEEP) '",
+        "BT ET 1 2 (KEEP) \""}) {
+    AddXObject("Im1", figure, "Form");
+    auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im1 Do"});
+    EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get())) << figure;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, NestedFormsAreCheckedRecursively) {
+  AddXObject("Inner", "(KEEP) Tj", "Form");
+  AddXObject("Outer", "q /Inner Do Q", "Form");
+  auto rejected = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Outer Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(rejected.Get()));
+
+  AddXObject("Inner", "BT /F1 12 Tf (KEEP) Tj ET", "Form");
+  AddXObject("Outer", "q /Inner Do Q", "Form");
+  auto accepted = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Outer Do"});
+  EXPECT_EQ(Result::kSuccess, Remove(accepted.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormDoesNotBorrowThePagesXObjects) {
+  // Here both resolve the page's /Im; nested deeper, PDFium falls back to the
+  // page and poppler to the caller chain, so never fall back.
+  AddXObject("Outer", "q /Im Do Q", "Form");
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Outer Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormKeywordMustBeAKnownOperator) {
+  // pdf.js splits "Tjq" into Tj and q, and reads a stray byte as its own token.
+  for (const char* figure : {"(KEEP) Tjq", "(KEEP) \x80Tj"}) {
+    AddXObject("Im1", figure, "Form");
+    auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im1 Do"});
+    EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get())) << figure;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormQCanRestoreTheCallersCursor) {
+  // q/Q save the text position in PDFium, pdf.js and poppler alike.
+  for (const char* figure : {"q BT Q (KEEP) Tj ET", "BT Q (KEEP) Tj ET"}) {
+    AddXObject("Im1", figure, "Form");
+    auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im1 Do"});
+    EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get())) << figure;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormDoInsideRestoredTextObjectRejects) {
+  // Q brings back the caller's position inside BT; Do is not allowed there.
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  AddXObject("Im1", "q BT Q /Im Do ET", "Form");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im1 Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormWithMalformedDictionaryRejects) {
+  // CPDF_StreamParser re-lexes BT after a non-name key; pdf.js swallows it.
+  AddXObject("Im1", "<< 1 BT >> (KEEP) Tj ET", "Form");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im1 Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormBytesOtherViewersMayReadRejects) {
+  // An external /F stream, or a filter that fails and leaves PDFium the raw
+  // bytes, can paint something other than what the scan saw.
+  auto external = AddXObject("Ext", "BT /F1 12 Tf (KEEP) Tj ET", "Form");
+  external->GetMutableDict()->SetNewFor<CPDF_Name>("F", "figure.pdf");
+  auto broken = AddXObject("Bad", "BT /F1 12 Tf (KEEP) Tj ET", "Form");
+  broken->GetMutableDict()->SetNewFor<CPDF_Name>("Filter", "FlateDecode");
+  for (const char* name : {"/Ext", "/Bad"}) {
+    auto page = MakePage(
+        {std::string("BT /F1 12 Tf (ERASE) Tj ET ") + name + " Do"});
+    EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get())) << name;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, DoWithSeveralOperandsRejects) {
+  // PDFium paints the last operand (/Fm, unsafe), not the first (/Im, safe).
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  AddXObject("Fm", "(KEEP) Tj", "Form");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im /Fm Do"});
+  // The parser marks such a Do invalid, so the operand check rejects first.
+  EXPECT_EQ(Result::kUnsupportedContent, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, DoSplitAcrossStreamsRejects) {
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Im", "Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormChainIsBoundedAtDepthSixteen) {
+  // Nesting is bounded so a long chain cannot exhaust the stack. The top-level
+  // Form is depth 0; a safe Form at depth 16 passes, one at depth 17 does not.
+  for (int last : {16, 17}) {
+    const std::string prefix = "C" + std::to_string(last) + "_";
+    AddXObject(prefix + std::to_string(last), "BT /F1 12 Tf (KEEP) Tj ET",
+               "Form");
+    for (int i = last - 1; i >= 0; --i) {
+      AddXObject(prefix + std::to_string(i),
+                 "/" + prefix + std::to_string(i + 1) + " Do", "Form");
+    }
+    auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /" + prefix + "0 Do"});
+    EXPECT_EQ(last == 16 ? Result::kSuccess : Result::kTextPositionDependency,
+              Remove(page.Get()))
+        << last;
+  }
+}
+
+TEST_F(CPDFSourceContentRemoverTest, NestedDoPaintsOnlyItsLoneNameOperand) {
+  // PDFium paints the last operand, here the string (Fm), not /Im.
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  AddXObject("Fm", "(KEEP) Tj", "Form");
+  AddXObject("Outer", "/Im (Fm) Do", "Form");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Outer Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, NestedNamesResolveInTheFormsResources) {
+  // Outer's own /X is unsafe while the page's /X is an Image.
+  AddXObject("X", "(KEEP) Tj", "Form");
+  AddXObject("Outer", "/X Do", "Form");
+  AddXObject("X", std::string(1, '\x80'), "Image");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Outer Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, FormWithoutResourcesUsesTheCallers) {
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  AddXObject("Bare", "/Im Do", "Form", /*own_resources=*/false);
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Bare Do"});
+  EXPECT_EQ(Result::kSuccess, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, DoInsideTextObjectAfterDeletedShowRejects) {
+  // ISO 32000 does not allow Do inside BT/ET; keep rejecting it when tainted.
+  AddXObject("Im", std::string(1, '\x80'), "Image");
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj /Im Do ET"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, SelfReferencingFormRejects) {
+  // Without its own resources the Form uses the page's, which name it again;
+  // the scan recurses until the depth limit.
+  AddXObject("Loop", "/Loop Do", "Form", /*own_resources=*/false);
+  auto page = MakePage({"BT /F1 12 Tf (ERASE) Tj ET /Loop Do"});
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+}
+
+TEST_F(CPDFSourceContentRemoverTest, UnprovenXObjectsAfterDeletedCursorReject) {
+  // Inline image data cannot be tokenized safely; PostScript XObjects and
+  // missing names are unknown.
+  AddXObject("Inline", "BI /W 1 /H 1 /BPC 8 /CS /G ID \x80 EI", "Form");
+  AddXObject("Ps", "BT /F1 12 Tf (KEEP) Tj ET", "PS");
+  for (const char* name : {"/Inline", "/Ps", "/Missing"}) {
+    auto page = MakePage(
+        {std::string("BT /F1 12 Tf (ERASE) Tj ET ") + name + " Do"});
+    EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get())) << name;
+  }
 }
 
 TEST_F(CPDFSourceContentRemoverTest, KeepsFormStreamAndResourceIdentityAfterQ) {
