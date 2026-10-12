@@ -86,9 +86,17 @@ std::optional<size_t> FindStream(const CPDF_SourceContent& source,
   return std::nullopt;
 }
 
+// A removed Tj/TJ no longer advances the text position. Retained text or a
+// Form that reads that position would move, so it is rejected. The position
+// is tracked under two models and must be independent under both:
+//  - PDFium: q/Q save and restore the text position (CPDF_AllStates), ET
+//    keeps it, and a Form inherits it, even outside BT.
+//  - ISO 32000: the text matrices exist only inside BT..ET and are not part
+//    of the graphics state, so Q does not restore them.
 Result ValidateCursorDependencies(const CPDF_SourceContent& source,
                                    const std::set<size_t>& selected) {
-  bool tainted = false;
+  bool pdfium_tainted = false;
+  bool spec_tainted = false;
   bool in_text = false;
   std::vector<bool> saved_taint;
   for (const auto& op : source.operations) {
@@ -99,27 +107,30 @@ Result ValidateCursorDependencies(const CPDF_SourceContent& source,
       return Result::kUnsupportedContent;
     }
     if (name == "q") {
-      saved_taint.push_back(tainted);
+      saved_taint.push_back(pdfium_tainted);
     } else if (name == "Q") {
       if (saved_taint.empty()) {
         return Result::kUnsupportedContent;
       }
-      tainted = saved_taint.back();
+      pdfium_tainted = saved_taint.back();
       saved_taint.pop_back();
     } else if (name == "BT") {
       if (in_text) {
         return Result::kUnsupportedContent;
       }
       in_text = true;
-      tainted = false;
+      pdfium_tainted = false;
+      spec_tainted = false;
     } else if (name == "ET") {
       if (!in_text) {
         return Result::kUnsupportedContent;
       }
       in_text = false;
-      // ET finalizes text clipping; PDFium does not reset text position here.
+      // The spec text matrices end here; PDFium keeps the position.
+      spec_tainted = false;
     } else if (name == "Tm" || name == "Td" || name == "TD" || name == "T*") {
-      tainted = false;
+      pdfium_tainted = false;
+      spec_tainted = false;
     } else if (name == "Tj" || name == "TJ" || name == "'" || name == "\"") {
       if (!in_text) {
         return Result::kUnsupportedContent;
@@ -127,17 +138,19 @@ Result ValidateCursorDependencies(const CPDF_SourceContent& source,
       if (removed) {
         // Only plain Tj/TJ pass selection validation. Neither changes the line
         // position; mark their current-text-position effect as unknown.
-        tainted = true;
+        pdfium_tainted = true;
+        spec_tainted = true;
       } else {
         // Retained quote operators first reset position from the text line.
         if (name == "'" || name == "\"") {
-          tainted = false;
+          pdfium_tainted = false;
+          spec_tainted = false;
         }
-        if (tainted) {
+        if (pdfium_tainted || spec_tainted) {
           return Result::kTextPositionDependency;
         }
       }
-    } else if (name == "Do" && tainted) {
+    } else if (name == "Do" && (pdfium_tainted || spec_tainted)) {
       // Form parsing copies the parent's whole CPDF_AllStates. Do not assume
       // a Form starts with BT. Conservatively reject image Do as well.
       return Result::kTextPositionDependency;

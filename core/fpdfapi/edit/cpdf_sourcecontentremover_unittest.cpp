@@ -204,9 +204,20 @@ TEST_F(CPDFSourceContentRemoverTest, QCanRestoreTaintedCursorAfterTm) {
   EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
 }
 
-TEST_F(CPDFSourceContentRemoverTest, QRestoresUntaintedSavedCursor) {
+TEST_F(CPDFSourceContentRemoverTest, QDoesNotRestoreTaintedCursor) {
+  // PDFium restores the text position on Q; spec viewers do not.
   auto page = MakePage({"BT /F1 12 Tf q (ERASE) Tj Q (KEEP) Tj ET"});
-  EXPECT_EQ(Result::kSuccess, Remove(page.Get()));
+  auto contents = page->GetDict()->GetObjectFor("Contents");
+  EXPECT_EQ(Result::kTextPositionDependency, Remove(page.Get()));
+  EXPECT_EQ(contents.Get(), page->GetDict()->GetObjectFor("Contents").Get());
+}
+
+TEST_F(CPDFSourceContentRemoverTest, CursorResetInsideOrAfterQClearsTaint) {
+  for (const char* body : {"q (ERASE) Tj 0 -14 Td Q (KEEP) Tj",
+                           "q (ERASE) Tj Q 0 -14 Td (KEEP) Tj"}) {
+    auto page = MakePage({std::string("BT /F1 12 Tf ") + body + " ET"});
+    EXPECT_EQ(Result::kSuccess, Remove(page.Get())) << body;
+  }
 }
 
 TEST_F(CPDFSourceContentRemoverTest, RejectsDoBeforeCursorReset) {
